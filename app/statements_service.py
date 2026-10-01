@@ -21,7 +21,8 @@ def _combined_key(namespace: int, key: int) -> int:
 
 # 当期"有效播放"：仅更正链链尾参与核算；同时沿 corrects_id 回溯出链的原始编号。
 # 递归从链尾出发向"更原始"方向走，depth 最大处 walk_id 即原始编号（root）。
-# LEFT JOIN 按发生时间匹配协议（协议区间不重叠，最多命中一条）。
+# LEFT JOIN 按发生时间匹配协议"现行版本"（版本表单语句快照：
+# 协议修订与出单/试算并发时，一版内不会读到半新半旧的区间与比例）。
 EFFECTIVE_PLAYS_SQL = """
 WITH RECURSIVE chain AS (
     SELECT import_id AS tail_id, import_id AS walk_id, 0 AS depth
@@ -41,16 +42,31 @@ SELECT
     p.work_code,
     p.occurred_at,
     p.amount,
-    a.id AS agreement_id
+    m.agreement_id,
+    m.percent AS shares
 FROM (
     SELECT DISTINCT ON (tail_id) tail_id, walk_id AS root_id
     FROM chain
     ORDER BY tail_id, depth DESC
 ) ch
 JOIN plays p ON p.import_id = ch.tail_id
-LEFT JOIN agreements a
-    ON a.work_code = p.work_code
-   AND tstzrange(a.valid_from, a.valid_to, '[)') @> p.occurred_at
+LEFT JOIN LATERAL (
+    SELECT x.agreement_id,
+           jsonb_object_agg(x.holder_code, x.percent::text ORDER BY x.holder_code) AS percent
+    FROM (
+        SELECT av.agreement_id, avs.holder_code, avs.percent
+        FROM agreements ag
+        JOIN agreement_versions av
+            ON av.agreement_id = ag.id
+           AND av.version = ag.current_version
+        JOIN agreement_version_shares avs
+            ON avs.agreement_id = av.agreement_id
+           AND avs.version = av.version
+        WHERE ag.work_code = p.work_code
+          AND tstzrange(av.valid_from, av.valid_to, '[)') @> p.occurred_at
+    ) x
+    GROUP BY x.agreement_id
+) m ON TRUE
 ORDER BY p.occurred_at, ch.tail_id
 """
 
@@ -94,25 +110,13 @@ def compute_current(conn, start: datetime, end: datetime):
           "agreement_id", "shares": {holder: percent},
           "parts":  {holder: 逐笔分摊整数},
         }
+
+    比例直接取协议现行版本（EFFECTIVE_PLAYS_SQL 的单语句快照 JSON），
+    不再二次查表，避免与并发修订读到撕裂状态。
     """
     rows = conn.execute(
         EFFECTIVE_PLAYS_SQL, {"start": start, "end": end}
     ).fetchall()
-
-    agreement_ids = {r["agreement_id"] for r in rows if r["agreement_id"] is not None}
-    shares_map: dict[int, dict[str, Decimal]] = {}
-    if agreement_ids:
-        share_rows = conn.execute(
-            """
-            SELECT agreement_id, holder_code, percent
-            FROM agreement_shares
-            WHERE agreement_id = ANY(%s)
-            ORDER BY holder_code
-            """,
-            (list(agreement_ids),),
-        ).fetchall()
-        for sr in share_rows:
-            shares_map.setdefault(sr["agreement_id"], {})[sr["holder_code"]] = sr["percent"]
 
     payable: dict[str, int] = {}
     pending: list[dict] = []
@@ -129,7 +133,7 @@ def compute_current(conn, start: datetime, end: datetime):
                 }
             )
             continue
-        shares = shares_map[r["agreement_id"]]
+        shares = {h: Decimal(p) for h, p in (r["shares"] or {}).items()}
         # 逐笔按比例分到最小货币单位，余数按规则补足
         parts = allocate(r["amount"], shares)
         for holder, amt in parts.items():

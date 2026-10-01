@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS rightsholders (
 );
 
 -- 分成协议：半开区间 [valid_from, valid_to)，valid_to 为空表示长期有效
--- 区间不重叠由应用层在"每作品事务咨询锁 + OVERLAPS 检测"下强制（无需 contrib 扩展）
+-- 协议编号（id）在协议修订（amendment）中保持稳定；区间/比例的历次内容保存在
+-- agreement_versions / agreement_version_shares 中，current_version 指向现行版。
+-- 现行版本之间区间不重叠由应用层在"每作品事务咨询锁 + OVERLAPS 检测"下强制。
 CREATE TABLE IF NOT EXISTS agreements (
     id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     work_code  text NOT NULL REFERENCES works(code),
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS agreements (
     valid_to   timestamptz,
     note       text,
     created_at timestamptz NOT NULL DEFAULT now(),
+    current_version integer NOT NULL DEFAULT 1,
     CONSTRAINT agreements_range_chk
         CHECK (valid_to IS NULL OR valid_to > valid_from)
 );
@@ -72,6 +75,145 @@ CREATE CONSTRAINT TRIGGER agreement_shares_total_trg
     AFTER INSERT OR UPDATE OR DELETE ON agreement_shares
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION check_shares_total();
+
+-- ---- 协议版本化（修订） ----
+-- 每次修订新增一行（version 递增）；协议编号 agreements.id 保持稳定、旧版可追溯。
+-- 播放按发生时刻匹配"现行版本"（agreements.current_version 指向的版本）。
+CREATE TABLE IF NOT EXISTS agreement_versions (
+    agreement_id bigint NOT NULL REFERENCES agreements(id) ON DELETE CASCADE,
+    version      integer NOT NULL CHECK (version > 0),
+    valid_from   timestamptz NOT NULL,
+    valid_to     timestamptz,
+    note         text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    superseded_at timestamptz,
+    PRIMARY KEY (agreement_id, version),
+    CONSTRAINT agreement_versions_range_chk
+        CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+-- 现行版本匹配播放发生时刻的主查询索引
+CREATE INDEX IF NOT EXISTS agreement_versions_current_idx
+    ON agreement_versions(agreement_id, version);
+
+CREATE TABLE IF NOT EXISTS agreement_version_shares (
+    agreement_id bigint NOT NULL,
+    version      integer NOT NULL,
+    holder_code  text NOT NULL REFERENCES rightsholders(code),
+    percent      numeric(8,4) NOT NULL CHECK (percent > 0 AND percent <= 100),
+    PRIMARY KEY (agreement_id, version, holder_code),
+    FOREIGN KEY (agreement_id, version)
+        REFERENCES agreement_versions(agreement_id, version) ON DELETE CASCADE
+);
+
+-- 幂等迁移：为"升级前已存在、尚无版本行"的协议回填第 1 版（旧版可追溯）
+INSERT INTO agreement_versions (agreement_id, version, valid_from, valid_to, note, created_at)
+SELECT a.id, 1, a.valid_from, a.valid_to, a.note, a.created_at
+FROM agreements a
+WHERE NOT EXISTS (
+    SELECT 1 FROM agreement_versions v WHERE v.agreement_id = a.id AND v.version = 1
+);
+INSERT INTO agreement_version_shares (agreement_id, version, holder_code, percent)
+SELECT s.agreement_id, 1, s.holder_code, s.percent
+FROM agreement_shares s
+WHERE NOT EXISTS (
+    SELECT 1 FROM agreement_version_shares vs
+    WHERE vs.agreement_id = s.agreement_id AND vs.version = 1
+      AND vs.holder_code = s.holder_code
+);
+
+CREATE OR REPLACE FUNCTION check_version_shares_total() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    total numeric(12,4);
+    aid   bigint;
+    ver   integer;
+BEGIN
+    aid := COALESCE(NEW.agreement_id, OLD.agreement_id);
+    ver := COALESCE(NEW.version, OLD.version);
+    SELECT sum(percent) INTO total
+    FROM agreement_version_shares
+    WHERE agreement_id = aid AND version = ver;
+    IF total IS DISTINCT FROM 100.0000 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'check_violation',
+            MESSAGE = 'agreement version shares must total 100 percent, got '
+                      || COALESCE(total::text, '0');
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS agreement_version_shares_total_trg ON agreement_version_shares;
+-- 延迟约束触发器：与 agreement_shares 同理，允许先插版本、再逐条插分成
+CREATE CONSTRAINT TRIGGER agreement_version_shares_total_trg
+    AFTER INSERT OR UPDATE OR DELETE ON agreement_version_shares
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION check_version_shares_total();
+
+-- 历史不可变：协议版本与其比例一经写入即禁止修改/删除（版本只能追加）。
+-- 例外：旧版被修订取代时，仅允许把 superseded_at 从空置为非空一次，
+-- 版本的区间、比例与 note 等历史内容恒不改写。
+CREATE OR REPLACE FUNCTION agreement_versions_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'agreement versions are append-only and must not be deleted';
+    END IF;
+    IF OLD.agreement_id = NEW.agreement_id
+       AND OLD.version = NEW.version
+       AND OLD.valid_from = NEW.valid_from
+       AND OLD.valid_to IS NOT DISTINCT FROM NEW.valid_to
+       AND OLD.note IS NOT DISTINCT FROM NEW.note
+       AND OLD.created_at = NEW.created_at
+       AND OLD.superseded_at IS NULL
+       AND NEW.superseded_at IS NOT NULL
+    THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'agreement versions are frozen; only a one-time superseded_at '
+                  || 'stamp is allowed when superseded by an amendment';
+END;
+$$;
+DROP TRIGGER IF EXISTS agreement_versions_frozen_trg ON agreement_versions;
+CREATE TRIGGER agreement_versions_frozen_trg
+    BEFORE UPDATE OR DELETE ON agreement_versions
+    FOR EACH ROW EXECUTE FUNCTION agreement_versions_frozen();
+DROP TRIGGER IF EXISTS agreement_version_shares_frozen_trg ON agreement_version_shares;
+CREATE TRIGGER agreement_version_shares_frozen_trg
+    BEFORE UPDATE OR DELETE ON agreement_version_shares
+    FOR EACH ROW EXECUTE FUNCTION agreement_versions_frozen();
+
+-- 协议主表受控更新：协议编号/作品/创建时间恒不可改、协议不可删除；
+-- 修订时只允许 current_version 递增（区间/比例镜像列同步指向新现行版）。
+CREATE OR REPLACE FUNCTION agreements_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'agreements must not be deleted; old versions remain traceable';
+    END IF;
+    IF NEW.id = OLD.id
+       AND NEW.work_code = OLD.work_code
+       AND NEW.created_at = OLD.created_at
+       AND NEW.current_version = OLD.current_version + 1
+    THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'agreements are immutable; amendments may only advance '
+                  || 'current_version to a newly appended version';
+END;
+$$;
+DROP TRIGGER IF EXISTS agreements_guarded_trg ON agreements;
+CREATE TRIGGER agreements_guarded_trg
+    BEFORE UPDATE OR DELETE ON agreements
+    FOR EACH ROW EXECUTE FUNCTION agreements_guarded();
 
 -- 播放记录：import_id 为调用方提供的唯一编号
 CREATE TABLE IF NOT EXISTS plays (

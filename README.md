@@ -5,6 +5,21 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
 - 作品与权利人登记，分成协议登记（适用起止时间、多名权利人及各自比例）；
   - 同一作品协议区间不得重叠（"每作品事务咨询锁 + 区间重叠检测"强制，**无需任何 contrib 扩展**）；
   - 每笔协议比例须合计 **100%**（应用层 + 数据库延迟约束触发器双重校验）。
+  - **协议修订（运营按协议编号提交带时区的新适用区间与完整权利人比例）**：
+    - 先 **预览** 受影响播放的待处理变化（获得匹配/失去匹配/重新分摊）
+      与**已出单期间各权利人的应付差额**，预览**不改任何账**，返回一次性预览令牌；
+    - **确认**时若该作品的**现行协议、相关播放更正链或相关期间单据**在预览后变化，
+      或所基于版本已过期、令牌/内容不符，一律 **409 拒绝且不修改数据**；
+      新区间与其他现行协议**不得重叠**、比例须合计 **100%**，
+      无效区间、未知权利人和不存在的协议同样拒绝；
+    - 确认后**协议编号保持稳定、版本递增、旧版可追溯查询**（版本只追加，
+      版本行/比例/协议主表由触发器保护不可改写或删除）；
+    - 播放自确认后**按发生时刻使用现行版本**重算：失去协议匹配的播放**转待处理**，
+      新区间延伸覆盖的播放离开待处理；**已出单期间不自动改写**，
+      各权利人正负差额在再出具时**经原追补机制**体现（含逐笔 removed/added 归因）；
+    - 既有单据、逐笔归因、付款/预留/退回历史**一律不改写**；
+      原协议登记与查询接口的**入参、已有响应字段与错误约定保持兼容**
+      （登记/详情响应仅新增 `version` 字段）。
 - 播放记录导入：调用方唯一编号、作品、发生时间、非负整数金额（最小货币单位）。
   - 同编号同内容 **幂等**；同编号异内容 **拒绝（409）**；
   - 更正必须引用原编号（`corrects_id`）并使用新编号；**分叉、循环更正拒绝**；
@@ -133,6 +148,7 @@ docker compose down -v       # 同时删除数据库卷
 | `POSTGRES_PASSWORD` | `royalty` | 数据库密码 |
 | `POSTGRES_DB` | `royalty` | 数据库名 |
 | `DATABASE_URL`（仅 API 容器） | `postgresql://royalty:royalty@db:5432/royalty` | 数据库连接串 |
+| `AMENDMENT_TOKEN_SECRET`（仅 API 容器） | 内置默认值 | 协议修订预览令牌的 HMAC 签名密钥；默认值可单机直接运行，**多实例/生产请覆盖为同一密钥**（令牌仅防篡改、不承担保密，且不含付款等无关数据） |
 
 本地裸机运行（不使用 Docker）：
 
@@ -159,7 +175,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/rightsholders` | 权利人列表 |
 | POST | `/agreements` | 登记分成协议（区间重叠 409；比例合计≠100% 422） |
 | GET | `/agreements?work_code=` | 协议列表（可按作品过滤） |
-| GET | `/agreements/{id}` | 协议详情 |
+| GET | `/agreements/{id}` | 协议详情（含现行版本号 `version`） |
+| POST | `/agreements/{id}/amendments/preview` | 预览协议修订（新区间+完整比例）：受影响播放待处理变化、已出单期间各权利人应付差额；不改账，返回预览令牌 |
+| POST | `/agreements/{id}/amendments/confirm` | 凭预览令牌确认修订：追加新版本（编号稳定、旧版可追溯）；过期/篡改/预览后状态变化 409 |
+| GET | `/agreements/{id}/versions` | 协议全部版本（标注现行版本、旧版被取代时间） |
+| GET | `/agreements/{id}/versions/{version}` | 指定版本详情（不存在 404 `agreement_version_not_found`） |
 
 ### 播放记录
 
@@ -501,6 +521,105 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   `statement_line_amount`（原单据明细行金额）与 `reconciles`（两者是否相等）；
 - `traceable=false`：存量不可追溯单据，`records` 为空、`reconciles` 恒为 false。
 
+#### 协议修订（按协议编号提交新版本）
+
+运营可按**协议编号**及其**现行版本**，提交带时区的**新适用区间**与**完整权利人比例**
+（不是增量）。分两步：先 **preview**（预览，不改账）、再 **confirm**（确认，追加版本）。
+
+**预览** `POST /agreements/{agreement_id}/amendments/preview` 请求体与登记协议一致
+（`work_code` 由协议编号确定，无需也不能在体中给出）：
+
+```json
+{
+  "valid_from": "2026-05-01T00:00:00+08:00",
+  "valid_to": "2027-01-01T00:00:00+08:00",
+  "note": "2026 年 5 月起改为两方各半",
+  "shares": [
+    {"holder_code": "RS-A", "percent": "50"},
+    {"holder_code": "RS-B", "percent": "50"}
+  ]
+}
+```
+
+- `valid_to` 可省略（长期有效）；区间为半开 `[valid_from, valid_to)`，
+  `valid_to <= valid_from` 或时间**不带时区** → **422**；
+- `shares` 为**完整比例**，须合计恰好 **100%**、权利人编号不得重复，否则 **422**；
+  比例中的权利人**必须已建档**（预览无任何写副作用，不自动建档）→ 否则
+  **422 `holder_not_found`**（`detail.missing_holder_codes` 列出缺失编号）；
+- 新区间与该作品**其他现行协议**（目标协议自身除外）重叠 →
+  **409 `agreement_overlap`**（`detail.other_agreement_id`）；协议不存在 → 404。
+
+预览响应（HTTP 200，`status="preview"`）**不修改任何数据**，要点：
+
+- `agreement`：`id`（协议编号，稳定）、`current_version`（所见版本）、`proposed_version`；
+- `affected_plays[]`：受影响的**更正链链尾**播放，每条给出
+  `import_id`/`root_import_id`（更正链原始编号）/`occurred_at`/`amount`，以及
+  `change_type`：
+  - `become_allocated`：原无匹配（待处理），修订后**获得**本协议匹配；
+  - `become_pending`：原本由本协议覆盖，修订后**失去匹配转待处理**；
+  - `reallocated`：前后均有匹配（区间/比例变化，或区间让出给/延伸自其他现行协议）；
+  - 并附 `old`/`new` 两侧的 `agreement_id`、`version`、`shares` 与逐笔 `allocation`；
+- `pending_changes`：`to_pending[]`（确认后转待处理）、`from_pending[]`（确认后离开待处理）；
+- `affected_periods[]`：每个覆盖了受影响播放的**已出单期间**：
+  - `payable_delta_work[]`：仅因**本作品本次修订**导致的该期间各权利人**应付差额**（可正可负）；
+  - `currently_pending[]`：该期间当前待处理清单中、确认后将获得匹配的播放；
+  - `pending_after[]`：确认并按现行版本重算后该期间的**完整待处理清单预测**；
+  - `projected_supplement[]`：确认后**再出具**时将经原追补机制生成的各权利人差额
+    （= 修订后全部应付投影 − 该期间已入账累计；为 0 不列出，差额**可正可负**）；
+- `preview_token`：一次性预览令牌（HMAC 签名，内含**所见版本**、**拟提交内容**与
+  **状态指纹**）。
+
+**确认** `POST /agreements/{agreement_id}/amendments/confirm` 请求体 = 预览体 +
+`preview_token`：
+
+```json
+{
+  "valid_from": "2026-05-01T00:00:00+08:00",
+  "valid_to": "2027-01-01T00:00:00+08:00",
+  "note": "2026 年 5 月起改为两方各半",
+  "shares": [
+    {"holder_code": "RS-A", "percent": "50"},
+    {"holder_code": "RS-B", "percent": "50"}
+  ],
+  "preview_token": "<上一步返回的令牌>"
+}
+```
+
+- 成功 **201**、`status="amended"`：追加新版本，响应结构与预览一致
+  （`agreement.previous_version/current_version` 分别为旧/新版本号）；
+- 协议不存在 → **404 `agreement_not_found`**；
+- 令牌缺失/为空/格式错误/签名不符/属于其他协议/与**预览时的区间或比例不一致** →
+  **409 `amendment_preview_invalid`**；
+- 令牌所基于的现行版本**已过期**（他人已先确认一次修订）→
+  **409 `agreement_version_conflict`**（`detail.previewed_version/current_version`），
+  同一令牌重放亦报此错；
+- 预览后该作品的**现行协议、相关播放更正链或相关期间单据**发生变化 →
+  **409 `amendment_preview_stale`**，**拒绝且不修改任何数据**；请重新预览后再确认；
+- 确认时在同一事务内**重新校验**区间/比例/重叠全部规则（任一不满足同样拒绝，不留半成品）。
+
+确认后的结算口径：
+
+- **协议编号（`id`）保持稳定、版本号 `current_version` 递增**；版本只追加，
+  旧版的区间、比例、note 一经写入**不可改写或删除**（数据库触发器强制），
+  旧版被取代时仅允许置位一次 `superseded_at`；协议主表除 `current_version`
+  推进与现行镜像列同步外不可改、不可删；
+- 播放**自确认后按发生时刻使用现行版本**重算（单语句快照，与修订并发不会读到撕裂状态）：
+  失去匹配的播放**转待处理**，新区间延伸覆盖的播放离开待处理并参与分摊；
+- **确认只改协议版本本身，不自动重出任何单据**；既有单据、逐笔归因、
+  付款/预留指令/银行退回历史**一律不改写**。已出单期间的各权利人正负差额在
+  再调用 `POST /statements/issue` 时**经原追补机制**体现（逐笔 `removed`/`added`
+  归因照常冻结，负额逐笔保留不轧差），试算口径见 `GET /statements/preview`。
+
+版本追溯（旧版始终可查）：
+
+- `GET /agreements/{id}/versions`：`current_version` 与 `versions[]`
+  （每版 `version`、`is_current`、区间、`note`、`created_at`、`superseded_at`、`shares`）；
+- `GET /agreements/{id}/versions/{version}`：指定版本；不存在 →
+  **404 `agreement_version_not_found`**。
+
+兼容性：`POST /agreements`、`GET /agreements`、`GET /agreements/{id}` 的**入参不变**，
+已有响应字段与错误约定不变，仅在响应中**新增**现行版本号字段 `version`。
+
 ## 调用示例
 
 一键演示脚本（请先启动服务），覆盖幂等、异内容拒绝、区间重叠、更正链/分叉拒绝、
@@ -515,6 +634,13 @@ bash examples/demo.sh
 
 ```bash
 bash examples/demo_instructions.sh
+```
+
+协议修订（预览受影响播放与已出单期间差额、确认追加版本、过期/篡改/状态变化拒绝、
+旧版可追溯、失去匹配转待处理、再出具经追补机制体现正负差额）的独立演示脚本：
+
+```bash
+bash examples/demo_amendments.sh
 ```
 
 手工调用（以下为关键几步）：
@@ -566,6 +692,42 @@ curl -sS -X POST http://localhost:8000/plays/import \
 curl -sS -X POST http://localhost:8000/statements/issue \
   -H 'Content-Type: application/json' \
   -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}'
+```
+
+协议修订（按上面协议编号 1 提交 v2；先预览后确认，再对已出单期间追补）：
+
+```bash
+# 7a. 预览：区间收窄到 [2026-05-01, 2027-01-01)、两方各半；返回受影响播放、
+#     已出单期间各权利人应付差额与 preview_token（不改账）
+curl -sS -X POST http://localhost:8000/agreements/1/amendments/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "valid_from":"2026-05-01T00:00:00+08:00",
+    "valid_to":"2027-01-01T00:00:00+08:00",
+    "shares":[{"holder_code":"RS-A","percent":"50"},
+              {"holder_code":"RS-B","percent":"50"}]
+  }' | python3 -m json.tool
+
+# 7b. 确认（把上一步 preview_token 原样带回；区间/比例须与预览一致）
+curl -sS -X POST http://localhost:8000/agreements/1/amendments/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "valid_from":"2026-05-01T00:00:00+08:00",
+    "valid_to":"2027-01-01T00:00:00+08:00",
+    "shares":[{"holder_code":"RS-A","percent":"50"},
+              {"holder_code":"RS-B","percent":"50"}],
+    "preview_token":"<preview_token>"
+  }' | python3 -m json.tool
+
+# 7c. 协议编号仍为 1、版本升为 2；旧版可追溯
+curl -sS http://localhost:8000/agreements/1/versions | python3 -m json.tool
+
+# 7d. 2 月播放失去协议匹配：再出具 => 负额追补（经原追补机制），播放转待处理；
+#     历史初次单与逐笔归因不改写
+curl -sS -X POST http://localhost:8000/statements/issue \
+  -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' \
+  | python3 -m json.tool
 ```
 
 出具后，财务按单据核对每笔金额来自哪些播放（归因记录分页查询）：
@@ -768,7 +930,12 @@ python3 -m unittest discover -s tests -v
 同付款多笔并发退回不合计超额/退回与付款及出单并发余额一致无死锁/
 对账单付款与退回总额分列）与回单核验（整批拒绝/幂等重试/异内容复用/跨批次重复回单/
 冻结结论与累计退回额/迟到付款及退回复核版本化/并发复核与并发导入/
-付款退回与复核并发快照一致/核验不改写账务）各有一套：
+付款退回与复核并发快照一致/核验不改写账务）各有一套；
+协议修订（版本化与旧版追溯/预览静态校验与影响试算/确认令牌与乐观并发
+（内容不符/坏令牌/过期版本/预览后协议·更正链·单据变化 stale）/
+拒绝不改数据/确认后按现行版本匹配、失去匹配转待处理/再出具经原追补机制正负差额/
+历史单据·归因·付款退回不改写/版本与协议表触发器不可变/同作品并发修订仅一胜）
+另有一套：
 
 ```bash
 pip install pgserver httpx
@@ -778,6 +945,7 @@ PYTHONPATH=. python3 tests/integration_payments.py       # 付款登记与权利
 PYTHONPATH=. python3 tests/integration_instructions.py   # 付款额度预留指令（两阶段付款）
 PYTHONPATH=. python3 tests/integration_refunds.py        # 银行退票登记与回单退回额冻结
 PYTHONPATH=. python3 tests/integration_receipts.py       # 银行回单批次导入与付款核验
+PYTHONPATH=. python3 tests/integration_amendments.py     # 协议修订（预览/确认/版本追溯/追补）
 ```
 
 ## 目录结构
@@ -786,16 +954,18 @@ PYTHONPATH=. python3 tests/integration_receipts.py       # 银行回单批次导
 app/
   main.py                 # FastAPI 入口、生命周期、异常映射
   config.py               # 环境配置
-  db.py                   # 连接池与幂等建表脚本（全部约束在此）
+  db.py                   # 连接池与幂等建表脚本（全部约束在此，含协议版本表/触发器与存量回填）
   allocation.py           # 逐笔按比例分摊（最大余数法 + 编号次序）
   schemas.py              # Pydantic 模型与输入校验
-  statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥、逐笔归因冻结与分页对账
+  amendment_tokens.py     # 协议修订预览令牌（HMAC 签名 + 所见状态指纹，乐观并发）
+  amendments_service.py   # 协议修订：预览影响试算/确认追加版本/版本追溯（每作品锁、单语句快照匹配）
+  statements_service.py   # 期间匹配（协议现行版本）、重算、初次/追补出具、并发互斥、逐笔归因冻结与分页对账
   payments_service.py     # 付款登记（流水号锁/余额校验/幂等冲突）、可用额（避开待确认预留）、权利人对账单、出单侧权利人行锁
   instructions_service.py # 额度预留指令：预留/取消/确认（指令号锁+流水号锁+权利人行锁；负额追补为更早 pending 留足）
   refunds_service.py      # 银行退票登记（退回流水号锁 + 原付款行锁 + 权利人行锁，累计超额拒绝/幂等冲突）
   receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论与累计退回额冻结、复核版本化
   routers/
-    catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
+    catalog.py            # 作品 / 权利人 / 协议（区间互斥、协议修订预览/确认、版本追溯）
     plays.py              # 播放导入、幂等、更正链
     statements.py         # 单据出具、试算、查询、逐笔归因分页查询
     payments.py           # 付款登记、按权利人对账
@@ -804,6 +974,7 @@ app/
     receipts.py           # 回单批次导入、复核、版本查询
 examples/demo.sh          # 端到端 curl 示例（含银行退票登记与退回后复核）
 examples/demo_instructions.sh  # 两阶段付款（预留/取消/确认）端到端 curl 示例
-tests/                    # 单元测试与六套 pgserver 端到端集成测试
+examples/demo_amendments.sh    # 协议修订（预览/确认/版本追溯/追补）端到端 curl 示例
+tests/                    # 单元测试与七套 pgserver 端到端集成测试（含协议修订）
 Dockerfile  docker-compose.yml  requirements.txt
 ```

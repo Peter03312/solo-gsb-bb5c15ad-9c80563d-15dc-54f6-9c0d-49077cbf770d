@@ -89,6 +89,8 @@ class AgreementOut(BaseModel):
     valid_from: datetime
     valid_to: datetime | None
     note: str | None
+    # 现行版本号（协议修订后递增；协议编号 id 保持稳定）
+    version: int = 1
     shares: list[AgreementShareOut]
 
 
@@ -199,6 +201,142 @@ class StatementSummary(BaseModel):
     traceable: bool = True
     lines: list[StatementLineOut]
     pending: list[PendingItem]
+
+
+# ---- 协议修订（按协议编号提交新版本的适用区间与完整比例） ----
+
+class AmendmentIn(BaseModel):
+    # 新适用区间（半开 [valid_from, valid_to)，时间必须带时区）；
+    # valid_to 省略表示长期有效；valid_to <= valid_from 为无效区间（422）
+    valid_from: datetime
+    valid_to: datetime | None = None
+    note: str | None = None
+    # 完整权利人比例（不是增量），须合计恰好 100%
+    shares: list[ShareIn] = Field(min_length=1)
+
+    @field_validator("valid_from", "valid_to")
+    @classmethod
+    def tz(cls, v: datetime | None, info):
+        if v is not None:
+            _tz_aware(v, info.field_name)
+        return v
+
+    @model_validator(mode="after")
+    def validate_model(self):
+        if self.valid_to is not None and self.valid_to <= self.valid_from:
+            raise ValueError("valid_to must be later than valid_from")
+        holder_codes = [s.holder_code for s in self.shares]
+        if len(set(holder_codes)) != len(holder_codes):
+            raise ValueError("duplicate holder_code in shares")
+        total = sum((s.percent for s in self.shares), Decimal(0))
+        if total != Decimal(100):
+            raise ValueError(f"shares percent must total exactly 100, got {total}")
+        return self
+
+
+class AmendmentConfirmIn(AmendmentIn):
+    # 预览返回的令牌；缺失/篡改/过期（状态已变化）均拒绝
+    preview_token: str = Field(min_length=1, max_length=8000)
+
+
+class AmendmentPlayRef(BaseModel):
+    import_id: str
+    root_import_id: str
+    work_code: str
+    occurred_at: datetime
+    amount: int
+
+
+class AmendmentAllocationSide(BaseModel):
+    # 旧/新匹配协议；无匹配（待处理）时为 None
+    agreement_id: int | None
+    # 旧/新匹配版本；匹配的是其他协议时为其现行版本，本协议时为旧版/新版
+    version: int | None
+    shares: list[AgreementShareOut] | None
+    # 逐笔分摊（holder -> 整数分额；无匹配为 None）
+    allocation: dict[str, int] | None
+
+
+class AmendmentAffectedPlay(AmendmentPlayRef):
+    # become_allocated=原本待处理、修订后获得本协议匹配；
+    # become_pending=原本由本协议覆盖、修订后失去匹配转待处理；
+    # reallocated=修订前后均有匹配（区间/比例变化导致逐笔分摊变化，
+    #   含新区间延伸到此前由其他协议覆盖的播放、或让出给其他协议的播放）
+    change_type: str
+    old: AmendmentAllocationSide
+    new: AmendmentAllocationSide
+
+
+class AmendmentPendingChanges(BaseModel):
+    # 确认后将转入待处理的播放（旧区间覆盖、新区间不覆盖）
+    to_pending: list[AmendmentPlayRef]
+    # 确认后将离开待处理、获得匹配的播放（新区间延伸覆盖）
+    from_pending: list[AmendmentPlayRef]
+
+
+class AmendmentPeriodDelta(BaseModel):
+    period_start: datetime
+    period_end: datetime
+    # 仅因本作品协议修订导致的该作品应付变化（holder -> 有符号差额）
+    payable_delta_work: list[StatementLineOut]
+    # 当前（修订前）该期间已冻结待处理清单中、确认后将离开待处理的播放
+    currently_pending: list[AmendmentPlayRef]
+    # 确认并重算后该期间的完整待处理清单预测
+    pending_after: list[PendingItem]
+    # 再出具时预计生成的追补单各权利人差额（当前全部应付投影 - 已入账累计，
+    #   可正可负；为 0 的权利人不列出）
+    projected_supplement: list[StatementLineOut]
+
+
+class AmendmentPreviewOut(BaseModel):
+    status: str  # preview
+    agreement: dict
+    agreement_id: int
+    work_code: str
+    current_version: int
+    proposed_version: int
+    valid_from: datetime
+    valid_to: datetime | None
+    note: str | None
+    shares: list[AgreementShareOut]
+    affected_plays: list[AmendmentAffectedPlay]
+    pending_changes: AmendmentPendingChanges
+    affected_periods: list[AmendmentPeriodDelta]
+    preview_token: str
+
+
+class AmendmentConfirmOut(BaseModel):
+    status: str  # amended
+    agreement: dict
+    agreement_id: int
+    work_code: str
+    current_version: int
+    proposed_version: int
+    valid_from: datetime
+    valid_to: datetime | None
+    note: str | None
+    shares: list[AgreementShareOut]
+    affected_plays: list[AmendmentAffectedPlay]
+    pending_changes: AmendmentPendingChanges
+    affected_periods: list[AmendmentPeriodDelta]
+
+
+class AgreementVersionOut(BaseModel):
+    version: int
+    is_current: bool
+    valid_from: datetime
+    valid_to: datetime | None
+    note: str | None
+    created_at: datetime
+    superseded_at: datetime | None
+    shares: list[AgreementShareOut]
+
+
+class AgreementVersionsOut(BaseModel):
+    agreement_id: int
+    work_code: str
+    current_version: int
+    versions: list[AgreementVersionOut]
 
 
 # ---- 逐笔归因证据 ----

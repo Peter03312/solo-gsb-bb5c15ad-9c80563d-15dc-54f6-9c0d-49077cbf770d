@@ -8,12 +8,19 @@ from ..errors import APIError
 from ..schemas import (
     AgreementOut,
     AgreementShareOut,
+    AgreementVersionOut,
+    AgreementVersionsOut,
+    AmendmentConfirmIn,
+    AmendmentIn,
+    AmendmentConfirmOut,
+    AmendmentPreviewOut,
     HolderIn,
     HolderOut,
     WorkIn,
     WorkOut,
     AgreementIn,
 )
+from .. import amendments_service
 
 router = APIRouter()
 
@@ -144,18 +151,39 @@ def create_agreement(body: AgreementIn, conn=Depends(get_conn)):
                 )
             row = conn.execute(
                 """
-                INSERT INTO agreements(work_code, valid_from, valid_to, note)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO agreements(work_code, valid_from, valid_to, note,
+                                       current_version)
+                VALUES (%s, %s, %s, %s, 1)
                 RETURNING id
                 """,
                 (body.work_code, body.valid_from, body.valid_to, body.note),
             ).fetchone()
             agreement_id = row["id"]
+            # 第 1 版内容同步写入版本表（协议修订时旧版即由此可追溯）
+            conn.execute(
+                """
+                INSERT INTO agreement_versions
+                    (agreement_id, version, valid_from, valid_to, note)
+                VALUES (%s, 1, %s, %s, %s)
+                """,
+                (agreement_id, body.valid_from, body.valid_to, body.note),
+            )
             with conn.cursor() as cur:
                 cur.executemany(
                     """
                     INSERT INTO agreement_shares(agreement_id, holder_code, percent)
                     VALUES (%s, %s, %s)
+                    """,
+                    [
+                        (agreement_id, s.holder_code, Decimal(str(s.percent)))
+                        for s in body.shares
+                    ],
+                )
+                cur.executemany(
+                    """
+                    INSERT INTO agreement_version_shares
+                        (agreement_id, version, holder_code, percent)
+                    VALUES (%s, 1, %s, %s)
                     """,
                     [
                         (agreement_id, s.holder_code, Decimal(str(s.percent)))
@@ -189,7 +217,7 @@ def get_agreement(agreement_id: int, conn=Depends(get_conn)):
 def _fetch_agreement(conn, agreement_id: int) -> AgreementOut:
     row = conn.execute(
         """
-        SELECT id, work_code, valid_from, valid_to, note
+        SELECT id, work_code, valid_from, valid_to, note, current_version
         FROM agreements WHERE id = %s
         """,
         (agreement_id,),
@@ -210,8 +238,69 @@ def _fetch_agreement(conn, agreement_id: int) -> AgreementOut:
         valid_from=row["valid_from"],
         valid_to=row["valid_to"],
         note=row["note"],
+        version=row["current_version"],
         shares=[
             AgreementShareOut(holder_code=s["holder_code"], percent=str(s["percent"]))
             for s in share_rows
         ],
     )
+
+
+@router.post(
+    "/agreements/{agreement_id}/amendments/preview",
+    response_model=AmendmentPreviewOut,
+    tags=["catalog"],
+)
+def preview_agreement_amendment(agreement_id: int, body: AmendmentIn, conn=Depends(get_conn)):
+    """按协议编号预览一次修订（新适用区间 + 完整权利人比例）。
+
+    - 完成全部静态校验：协议须存在、区间有效、比例合计 100%、
+      新区间与该作品其他现行协议不重叠、比例中的权利人均已建档；
+    - 返回受影响链尾播放（获得匹配/失去匹配/重新分摊）的待处理变化，
+      以及各已出单期间因本作品导致的应付差额与再出具追补单的预测差额；
+    - 预览不改任何数据，仅返回一次性预览令牌（amendment_preview_token）。
+    """
+    return amendments_service.preview_amendment(conn, agreement_id, body)
+
+
+@router.post(
+    "/agreements/{agreement_id}/amendments/confirm",
+    response_model=AmendmentConfirmOut,
+    status_code=201,
+    tags=["catalog"],
+)
+def confirm_agreement_amendment(agreement_id: int, body: AmendmentConfirmIn, conn=Depends(get_conn)):
+    """凭预览令牌确认修订：追加新版本，协议编号保持稳定，旧版可追溯。
+
+    - 令牌须来自同一协议、同一区间与同一完整比例；
+    - 预览后该作品现行协议、相关播放更正链或相关期间单据发生变化，
+      或所基于的现行版本已过期（他人已修订）：409 拒绝且不修改任何数据；
+    - 只更新协议版本本身：既有单据、逐笔归因、付款与退回历史一律不改写；
+      播放自确认后按发生时刻使用现行版本，失去匹配的播放转待处理，
+      已出单期间在再出具时经原追补机制体现正/负差额。
+    """
+    try:
+        return amendments_service.confirm_amendment(conn, agreement_id, body)
+    except psycopg.errors.CheckViolation as exc:
+        # 延迟触发器兜底：比例合计不为 100%
+        raise APIError(422, "shares_total_invalid", str(exc.diag.message_primary))
+
+
+@router.get(
+    "/agreements/{agreement_id}/versions",
+    response_model=AgreementVersionsOut,
+    tags=["catalog"],
+)
+def list_agreement_versions(agreement_id: int, conn=Depends(get_conn)):
+    """列出协议的全部版本（旧版始终可追溯），并标注现行版本。"""
+    return amendments_service.list_versions(conn, agreement_id)
+
+
+@router.get(
+    "/agreements/{agreement_id}/versions/{version}",
+    response_model=AgreementVersionOut,
+    tags=["catalog"],
+)
+def get_agreement_version(agreement_id: int, version: int, conn=Depends(get_conn)):
+    """查询协议指定版本（区间、比例、创建与被取代时间）；版本不存在 404。"""
+    return amendments_service.get_version(conn, agreement_id, version)

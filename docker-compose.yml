@@ -21,6 +21,8 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-royalty}:${POSTGRES_PASSWORD:-royalty}@db:5432/${POSTGRES_DB:-royalty}
+      # 协议修订预览令牌的 HMAC 密钥；未设置时使用内置默认值（单机可直接运行）
+      AMENDMENT_TOKEN_SECRET: ${AMENDMENT_TOKEN_SECRET:-}
     depends_on:
       db:
         condition: service_healthy
