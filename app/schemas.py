@@ -89,7 +89,132 @@ class AgreementOut(BaseModel):
     valid_from: datetime
     valid_to: datetime | None
     note: str | None
+    # 当前版本号：首次登记为 1，每次改版 +1（协议编号 id 保持稳定）
+    version: int = 1
     shares: list[AgreementShareOut]
+
+
+class AgreementVersionOut(BaseModel):
+    """协议的一个历史版本（现行版本的 version 等于 GET /agreements/{id} 的值）。"""
+    agreement_id: int
+    version: int
+    work_code: str
+    valid_from: datetime
+    valid_to: datetime | None
+    note: str | None
+    created_at: datetime
+    # 该版本被下一版取代的时间；现行版本为 None
+    superseded_at: datetime | None
+    current: bool
+    shares: list[AgreementShareOut]
+
+
+# ---- 协议改版（新适用区间 + 完整权利人比例）：先预览、后确认 ----
+
+class AgreementRevisionIn(BaseModel):
+    """改版请求（预览与确认同一入参）：
+    按协议编号定位，seen_version 为调用方所见的现行版本号。
+    """
+    agreement_id: int
+    seen_version: int = Field(ge=1)
+    valid_from: datetime
+    valid_to: datetime | None = None
+    note: str | None = None
+    shares: list[ShareIn] = Field(min_length=1)
+
+    @field_validator("valid_from", "valid_to")
+    @classmethod
+    def tz(cls, v: datetime | None, info):
+        if v is not None:
+            _tz_aware(v, info.field_name)
+        return v
+
+    @model_validator(mode="after")
+    def validate_model(self):
+        if self.valid_to is not None and self.valid_to <= self.valid_from:
+            raise ValueError("valid_to must be later than valid_from")
+        holder_codes = [s.holder_code for s in self.shares]
+        if len(set(holder_codes)) != len(holder_codes):
+            raise ValueError("duplicate holder_code in shares")
+        total = sum((s.percent for s in self.shares), Decimal(0))
+        if total != Decimal(100):
+            raise ValueError(f"shares percent must total exactly 100, got {total}")
+        return self
+
+
+class RevisionConfirmIn(AgreementRevisionIn):
+    """确认改版：完整提交新版内容 + 预览令牌（防篡改、绑定所见版本与预览时数据指纹）。"""
+    preview_token: str = Field(min_length=10, max_length=8192)
+
+
+class AffectedPlayOut(BaseModel):
+    """受改版影响的链尾播放（按播放发生时刻重新匹配后）。"""
+    import_id: str
+    root_import_id: str
+    work_code: str
+    occurred_at: datetime
+    amount: int
+    # 现行匹配协议编号（可能为 None=当前待处理）
+    before_agreement_id: int | None
+    # 新版区间生效后的匹配协议编号（None=将失去协议匹配，转待处理）
+    after_agreement_id: int | None
+    # 现行逐笔分摊（无协议匹配时为空对象）
+    before_shares: dict[str, int]
+    # 新版逐笔分摊（无协议匹配时为空对象）
+    after_shares: dict[str, int]
+    # 当前是否在待处理清单
+    before_pending: bool
+    # 新版生效后是否转待处理
+    after_pending: bool
+
+
+class IssuedPeriodImpactOut(BaseModel):
+    """已出单期间的应付影响预览（确认后须经原出具/追补机制体现，不自动改写单据）。"""
+    period_start: datetime
+    period_end: datetime
+    # 该期间已出具单据累计（已入账应付），权利人 -> 金额
+    billed: dict[str, int]
+    # 按现行数据重算的当前应付
+    current_payable: dict[str, int]
+    # 新版区间生效后的应付
+    projected_payable: dict[str, int]
+    # 本次改版造成的应付差额 = projected - current（各权利人，可正可负）
+    delta: dict[str, int]
+
+
+class RevisionPreviewOut(BaseModel):
+    agreement_id: int
+    work_code: str
+    seen_version: int
+    new_version: int
+    valid_from: datetime
+    valid_to: datetime | None
+    shares: list[AgreementShareOut]
+    # 确认凭证：绑定所见版本与预览时的协议/播放更正链/期间单据指纹
+    preview_token: str
+    affected_plays: list[AffectedPlayOut]
+    # 现行在账、新版后失去协议匹配而转待处理的播放
+    become_pending: list[AffectedPlayOut]
+    # 现行待处理、新版区间覆盖后重新获得协议匹配的播放
+    leave_pending: list[AffectedPlayOut]
+    # 已出单期间各权利人的应付差额（仅列差额非零的期间）
+    issued_periods: list[IssuedPeriodImpactOut]
+
+
+class RevisionConfirmOut(BaseModel):
+    """确认改版成功响应：版本切换结果 + 与预览同口径的影响明细（确认本身不出单）。"""
+    # 固定 "revised"
+    status: str
+    agreement_id: int
+    work_code: str
+    version: int
+    valid_from: datetime
+    valid_to: datetime | None
+    shares: list[AgreementShareOut]
+    affected_plays: list[AffectedPlayOut]
+    become_pending: list[AffectedPlayOut]
+    leave_pending: list[AffectedPlayOut]
+    issued_periods: list[IssuedPeriodImpactOut]
 
 
 class PlayIn(BaseModel):

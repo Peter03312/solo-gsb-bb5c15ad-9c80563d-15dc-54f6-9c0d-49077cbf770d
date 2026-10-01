@@ -15,6 +15,7 @@ from .routers import (
     refunds,
     statements,
 )
+from .routers import revisions
 
 
 @asynccontextmanager
@@ -26,7 +27,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="演出录音播放版税结算服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "登记作品与分成协议、导入播放记录（支持幂等与更正链）、"
         "按播放发生时间匹配协议并逐笔按比例分摊，按期间出具应付/追补单据，"
@@ -36,11 +37,16 @@ app = FastAPI(
         "登记银行退票（凭原付款流水号与退回流水号、累计不超额、退回加回余额），"
         "并按批次导入银行回单核验已登记付款（冻结逐行结论与累计退回额、"
         "迟到付款/退回复核版本化）。"
+        "协议改版：运营按协议编号与所见版本提交带时区的新适用区间与完整权利人比例，"
+        "先预览受影响播放的待处理变化与已出单期间各权利人应付差额，"
+        "确认时以数据指纹乐观并发控制（预览后协议/更正链/期间单据变化即拒绝），"
+        "协议编号保持稳定、旧版可追溯，已出单期间经原追补机制体现正负差额。"
     ),
     lifespan=lifespan,
 )
 
 app.include_router(catalog.router)
+app.include_router(revisions.router)
 app.include_router(plays.router)
 app.include_router(statements.router)
 app.include_router(payments.router)

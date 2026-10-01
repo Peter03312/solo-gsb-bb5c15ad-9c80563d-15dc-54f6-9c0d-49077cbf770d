@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 
 from ..db import get_conn
 from ..errors import APIError
+from ..locks import combined_lock_key
 from ..schemas import (
     AgreementOut,
     AgreementShareOut,
@@ -22,13 +23,7 @@ _AGREEMENT_LOCK_NS = 0x41475231  # "AGR1"
 
 
 def _combined_lock_key(namespace: int, work_code: str) -> int:
-    import hashlib
-
-    n = int.from_bytes(
-        hashlib.blake2b(work_code.encode(), digest_size=4).digest(), "big"
-    )
-    combined = (namespace << 32) | (n & 0xFFFFFFFF)
-    return combined - (1 << 64) if combined >= (1 << 63) else combined
+    return combined_lock_key(namespace, work_code)
 
 
 @router.post("/works", response_model=WorkOut, tags=["catalog"])
@@ -146,16 +141,38 @@ def create_agreement(body: AgreementIn, conn=Depends(get_conn)):
                 """
                 INSERT INTO agreements(work_code, valid_from, valid_to, note)
                 VALUES (%s, %s, %s, %s)
-                RETURNING id
+                RETURNING id, created_at
                 """,
                 (body.work_code, body.valid_from, body.valid_to, body.note),
             ).fetchone()
             agreement_id = row["id"]
+            # 首次登记即冻结第 1 版历史（协议编号此后保持稳定，改版只新增版本）
+            conn.execute(
+                """
+                INSERT INTO agreement_versions
+                    (agreement_id, version, work_code, valid_from, valid_to, note,
+                     created_at, superseded_at)
+                VALUES (%s, 1, %s, %s, %s, %s, %s, NULL)
+                """,
+                (agreement_id, body.work_code, body.valid_from, body.valid_to,
+                 body.note, row["created_at"]),
+            )
             with conn.cursor() as cur:
                 cur.executemany(
                     """
                     INSERT INTO agreement_shares(agreement_id, holder_code, percent)
                     VALUES (%s, %s, %s)
+                    """,
+                    [
+                        (agreement_id, s.holder_code, Decimal(str(s.percent)))
+                        for s in body.shares
+                    ],
+                )
+                cur.executemany(
+                    """
+                    INSERT INTO agreement_version_shares
+                        (agreement_id, version, holder_code, percent)
+                    VALUES (%s, 1, %s, %s)
                     """,
                     [
                         (agreement_id, s.holder_code, Decimal(str(s.percent)))
@@ -189,7 +206,7 @@ def get_agreement(agreement_id: int, conn=Depends(get_conn)):
 def _fetch_agreement(conn, agreement_id: int) -> AgreementOut:
     row = conn.execute(
         """
-        SELECT id, work_code, valid_from, valid_to, note
+        SELECT id, work_code, valid_from, valid_to, note, version
         FROM agreements WHERE id = %s
         """,
         (agreement_id,),
@@ -210,6 +227,7 @@ def _fetch_agreement(conn, agreement_id: int) -> AgreementOut:
         valid_from=row["valid_from"],
         valid_to=row["valid_to"],
         note=row["note"],
+        version=row["version"],
         shares=[
             AgreementShareOut(holder_code=s["holder_code"], percent=str(s["percent"]))
             for s in share_rows

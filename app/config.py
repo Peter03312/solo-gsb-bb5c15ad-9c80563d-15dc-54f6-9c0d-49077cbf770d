@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     db_max_size: int = 10
     # 小数比例最多保留的位数（百分比，4 位 = 0.0001%）
     percent_scale: int = 4
+    # 协议改版预览令牌（preview token）的 HMAC 签名密钥；
+    # 令牌为无状态、防篡改的"所见版本 + 数据指纹"凭证，确认时必须验签并复核。
+    revision_token_secret: str = "royalty-agreement-revision-token-v1"
 
     class Config:
         env_file = ".env"

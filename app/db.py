@@ -48,6 +48,115 @@ CREATE TABLE IF NOT EXISTS agreement_shares (
     PRIMARY KEY (agreement_id, holder_code)
 );
 
+-- 协议改版（本轮）：协议编号（agreements.id）保持稳定，每次改版新增一个版本号，
+-- agreements/agreement_shares 始终为"现行版本"，按播放发生时刻匹配协议的口径不变；
+-- 历史版本的区间、备注与完整权利人比例在下列两表逐版冻结、始终可追溯、不可修改/删除。
+ALTER TABLE agreements ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 1;
+ALTER TABLE agreements ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+
+CREATE TABLE IF NOT EXISTS agreement_versions (
+    agreement_id bigint NOT NULL REFERENCES agreements(id),
+    version      integer NOT NULL CHECK (version >= 1),
+    work_code    text NOT NULL,
+    valid_from   timestamptz NOT NULL,
+    valid_to     timestamptz,
+    note         text,
+    created_at   timestamptz NOT NULL,
+    superseded_at timestamptz,
+    PRIMARY KEY (agreement_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS agreement_version_shares (
+    agreement_id bigint NOT NULL,
+    version      integer NOT NULL,
+    holder_code  text NOT NULL,
+    percent      numeric(8,4) NOT NULL,
+    PRIMARY KEY (agreement_id, version, holder_code),
+    FOREIGN KEY (agreement_id, version)
+        REFERENCES agreement_versions(agreement_id, version)
+);
+
+-- 存量回填：建表前已登记的协议一律记为第 1 版（幂等，只补缺）
+INSERT INTO agreement_versions (agreement_id, version, work_code, valid_from, valid_to,
+                                note, created_at, superseded_at)
+SELECT a.id, 1, a.work_code, a.valid_from, a.valid_to, a.note, a.created_at, NULL
+FROM agreements a
+WHERE NOT EXISTS (
+    SELECT 1 FROM agreement_versions v
+    WHERE v.agreement_id = a.id AND v.version = 1
+);
+INSERT INTO agreement_version_shares (agreement_id, version, holder_code, percent)
+SELECT s.agreement_id, 1, s.holder_code, s.percent
+FROM agreement_shares s
+WHERE NOT EXISTS (
+    SELECT 1 FROM agreement_version_shares h
+    WHERE h.agreement_id = s.agreement_id AND h.version = 1 AND h.holder_code = s.holder_code
+);
+
+-- 协议行保护：禁止删除；UPDATE 只允许"版本号 +1 的改版"，
+-- 且编号、作品、创建时间恒不可改（应用层在同一事务内冻结旧版、换区间与比例）。
+CREATE OR REPLACE FUNCTION agreements_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'agreements are versioned and must not be deleted';
+    END IF;
+    IF NEW.id = OLD.id
+       AND NEW.work_code = OLD.work_code
+       AND NEW.created_at = OLD.created_at
+       AND NEW.version = OLD.version + 1
+    THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'agreement rows are immutable except a version +1 revision';
+END;
+$$;
+DROP TRIGGER IF EXISTS agreements_guarded_trg ON agreements;
+CREATE TRIGGER agreements_guarded_trg
+    BEFORE UPDATE OR DELETE ON agreements
+    FOR EACH ROW EXECUTE FUNCTION agreements_guarded();
+
+-- 历史版本与版本比例一经冻结即禁止修改/删除（旧版始终可追溯）。
+-- 唯一的例外：改版事务内对旧版本 superseded_at 的一次性回填（NULL -> 非空），
+-- 区间、备注、比例、创建时间等版本内容恒不可改。
+CREATE OR REPLACE FUNCTION agreement_versions_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'agreement versions are frozen history and must not be deleted';
+    END IF;
+    IF OLD.superseded_at IS NULL AND NEW.superseded_at IS NOT NULL
+       AND NEW.agreement_id = OLD.agreement_id
+       AND NEW.version = OLD.version
+       AND NEW.work_code = OLD.work_code
+       AND NEW.valid_from IS NOT DISTINCT FROM OLD.valid_from
+       AND NEW.valid_to IS NOT DISTINCT FROM OLD.valid_to
+       AND NEW.note IS NOT DISTINCT FROM OLD.note
+       AND NEW.created_at = OLD.created_at
+    THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'agreement versions are frozen; only a one-time superseded_at '
+                  || 'stamp is allowed on revision';
+END;
+$$;
+DROP TRIGGER IF EXISTS agreement_versions_frozen_trg ON agreement_versions;
+CREATE TRIGGER agreement_versions_frozen_trg
+    BEFORE UPDATE OR DELETE ON agreement_versions
+    FOR EACH ROW EXECUTE FUNCTION agreement_versions_frozen();
+DROP TRIGGER IF EXISTS agreement_version_shares_frozen_trg ON agreement_version_shares;
+CREATE TRIGGER agreement_version_shares_frozen_trg
+    BEFORE UPDATE OR DELETE ON agreement_version_shares
+    FOR EACH ROW EXECUTE FUNCTION agreement_versions_frozen();
+
 CREATE OR REPLACE FUNCTION check_shares_total() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
